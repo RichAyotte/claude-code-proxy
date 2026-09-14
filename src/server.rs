@@ -1,5 +1,5 @@
 use crate::{
-    anthropic::json_error,
+    anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     openai_compat::{
@@ -37,9 +37,10 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, LengthLimitError, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use std::error::Error;
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::Write;
@@ -1412,14 +1413,26 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await
+    {
         Ok(bytes) => bytes,
         Err(err) => {
-            let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Invalid JSON: {err}"),
-            );
+            let response = if err
+                .source()
+                .is_some_and(|source| source.is::<LengthLimitError>())
+            {
+                json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    "Request body exceeded the size limit",
+                )
+            } else {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Invalid JSON: {err}"),
+                )
+            };
             log_request_completed(
                 &log,
                 RequestLogContext {

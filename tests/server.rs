@@ -4,8 +4,10 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use claude_code_proxy::{
     MessagesRequest,
+    anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
+    openai_compat::MAX_OPENAI_REQUEST_BYTES,
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
@@ -470,6 +472,105 @@ async fn invalid_json_request_is_json_error() {
         .unwrap();
     let error_type = value["error"]["type"].as_str().unwrap_or("");
     assert_eq!(error_type, "invalid_request_error");
+}
+
+#[tokio::test]
+async fn oversized_messages_body_is_request_too_large() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b'x'; MAX_ANTHROPIC_REQUEST_BYTES + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let value: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "request_too_large");
+    assert_eq!(
+        value["error"]["message"],
+        "Request body exceeded the size limit"
+    );
+}
+
+#[tokio::test]
+async fn truncated_messages_body_is_invalid_json() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let stream = futures_util::stream::iter([
+        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{\"model\":\"")),
+        Err(std::io::Error::other("truncated")),
+    ]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Invalid JSON:"),
+        "response body: {value}"
+    );
+    assert!(
+        !message.contains("length limit exceeded"),
+        "response body: {value}"
+    );
+}
+
+#[tokio::test]
+async fn messages_body_above_openai_cap_is_not_a_length_limit() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b'x'; MAX_OPENAI_REQUEST_BYTES + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.starts_with("Invalid JSON:"),
+        "response body: {value}"
+    );
+    assert!(
+        !message.contains("length limit exceeded"),
+        "response body: {value}"
+    );
 }
 
 #[tokio::test]

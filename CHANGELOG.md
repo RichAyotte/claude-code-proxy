@@ -3,6 +3,10 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Claude Code requests over 16 MB no longer fail with `Invalid JSON: length limit exceeded`. Messages and token-count bodies are accepted up to Anthropic's 32 MB limit, and larger bodies return 413 `request_too_large`.
+
 ## v0.1.39 (2026-09-10)
 
 - OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
